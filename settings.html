@@ -1,0 +1,140 @@
+<div class="irodori_tts_settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>Irodori TTS</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+
+            <!-- Enable -->
+            <label class="irodori_tts_enable_row">
+                <input id="irodori_tts_enable" type="checkbox" />
+                <span class="irodori_tts_desc">&nbsp;Enable</span>
+            </label>
+
+            <hr>
+
+            <!-- エンドポイント -->
+            <label for="irodori_tts_endpoint">
+                <span class="irodori_tts_desc" data-i18n="Irodori TTS Endpoint">Server URL</span>
+            </label>
+            <div class="irodori_tts_endpoint_row">
+                <input id="irodori_tts_endpoint" type="text" class="text_pole" maxlength="250"
+                       placeholder="http://localhost:9040" />
+                <div id="irodori_tts_health" class="menu_button" title="Check server connection">
+                    <span data-i18n="Irodori TTS Health">&nbsp;Check</span>
+                </div>
+            </div>
+
+            <hr>
+
+            <!-- 参照音声 -->
+            <label>
+                <span class="irodori_tts_desc" data-i18n="Irodori TTS Reference Audio">Reference Audio</span>
+            </label>
+            <div class="irodori_tts_ref_row">
+                <div id="irodori_tts_ref_pick" class="menu_button irodori_tts_ref_pick" title="Select reference audio files">
+                    <i class="fa-solid fa-file-audio"></i>
+                    <span data-i18n="Irodori TTS Pick Ref">Add Files…</span>
+                </div>
+                <div id="irodori_tts_ref_pickdir" class="menu_button irodori_tts_ref_pick" title="Select an entire folder (use .wav files inside as references)">
+                    <i class="fa-solid fa-folder-open"></i>
+                    <span data-i18n="Irodori TTS Pick Dir">Add Folder…</span>
+                </div>
+                <input id="irodori_tts_ref_files" type="file" accept="audio/*" multiple hidden />
+                <input id="irodori_tts_ref_dir" type="file" webkitdirectory directory multiple hidden />
+            </div>
+            <div id="irodori_tts_ref_items" class="irodori_tts_ref_items"></div>
+
+            <hr>
+
+            <!-- ボリューム -->
+            <div class="irodori_tts_volume_block">
+                <span class="irodori_tts_volume_label irodori_tts_desc">Volume</span>
+                <div class="irodori_tts_volume_row">
+                    <input id="irodori_tts_volume" type="range" min="0" max="100" step="1" />
+                    <span id="irodori_tts_volume_val" class="irodori_tts_volume_val">80%</span>
+                </div>
+            </div>
+
+            <!-- 再生間隔 -->
+            <div class="irodori_tts_interval_block">
+                <span class="irodori_tts_interval_label irodori_tts_desc">Interval</span>
+                <div class="irodori_tts_interval_row">
+                    <input id="irodori_tts_interval" type="range" min="0" max="10" step="0.1" />
+                    <span id="irodori_tts_interval_val" class="irodori_tts_interval_val">0.0s</span>
+                </div>
+            </div>
+
+            <hr>
+
+            <!-- システムプロンプト -->
+            <label for="irodori_tts_sysprompt">
+                <span class="irodori_tts_desc" data-i18n="Irodori TTS TTS Prompt">TTS Prompt</span>
+            </label>
+            <div class="irodori_tts_prompt_row">
+                <select id="irodori_tts_prompt_select" class="text_pole" title="Select a prompt"></select>
+                <div id="irodori_tts_prompt_add" class="menu_button irodori_tts_icon_btn" title="Add a new prompt">
+                    <i class="fa-solid fa-plus"></i>
+                </div>
+                <div id="irodori_tts_prompt_rename" class="menu_button irodori_tts_icon_btn" title="Rename the current prompt">
+                    <i class="fa-solid fa-pencil"></i>
+                </div>
+                <div id="irodori_tts_prompt_del" class="menu_button irodori_tts_icon_btn" title="Delete the current prompt">
+                    <i class="fa-solid fa-trash-can"></i>
+                </div>
+            </div>
+            <textarea id="irodori_tts_sysprompt" class="text_pole" rows="6"
+                      placeholder="Instructions for the AI"></textarea>
+
+            <!-- Role / Connection Profile -->
+            <div class="irodori_tts_opts_row">
+                <div class="irodori_tts_opt">
+                    <label for="irodori_tts_role">
+                        <span class="irodori_tts_desc" data-i18n="Irodori TTS Role">Role</span>
+                    </label>
+                    <select id="irodori_tts_role" class="text_pole">
+                        <option value="user">User</option>
+                        <option value="system">System</option>
+                    </select>
+                </div>
+                <div class="irodori_tts_opt">
+                    <label for="irodori_tts_profile">
+                        <span class="irodori_tts_desc" data-i18n="Irodori TTS Profile">Connection</span>
+                    </label>
+                    <select id="irodori_tts_profile" class="text_pole">
+                        <option value="">(Current Profile)</option>
+                    </select>
+                </div>
+            </div>
+            <hr>
+
+            <!-- 音声テスト -->
+            <span class="irodori_tts_desc irodori_tts_test_header"><i class="fa-solid fa-flask"></i> Voice Test</span>
+
+            <div class="irodori_tts_testfield">
+
+            <!-- 参照音声 (リストから選択) -->
+            <div class="irodori_tts_ref_row">
+                <select id="irodori_tts_test_ref_select" class="irodori_tts_test_ref_select"></select>
+            </div>
+
+            <!-- セリフ -->
+            <label for="irodori_tts_text">
+                <span class="irodori_tts_desc" data-i18n="Irodori TTS Text">Dialogue</span>
+            </label>
+            <textarea id="irodori_tts_text" class="text_pole" rows="3"
+                      placeholder="Enter the dialogue to speak"></textarea>
+
+            <!-- 送信ボタン -->
+            <div class="irodori_tts_button_row">
+                <div id="irodori_tts_send" class="menu_button" title="Send to TTS server and play">
+                    <span data-i18n="Irodori TTS Send">Play</span>
+                </div>
+            </div>
+
+            </div><!-- /.irodori_tts_testfield -->
+
+        </div>
+    </div>
+</div>
