@@ -87,7 +87,7 @@
             <textarea id="irodori_tts_sysprompt" class="text_pole" rows="6"
                       placeholder="Instructions for the AI"></textarea>
 
-            <!-- Role / Connection Profile -->
+            <!-- Role / Chat History / Connection Profile -->
             <div class="irodori_tts_opts_row">
                 <div class="irodori_tts_opt">
                     <label for="irodori_tts_role">
@@ -97,6 +97,13 @@
                         <option value="user">User</option>
                         <option value="system">System</option>
                     </select>
+                </div>
+                <div class="irodori_tts_opt">
+                    <label for="irodori_tts_history">
+                        <span class="irodori_tts_desc" data-i18n="Irodori TTS Chat History">Chat History</span>
+                    </label>
+                    <input id="irodori_tts_history" class="text_pole" type="number" min="0" step="1" value="10"
+                           title="0 = include all chat history">
                 </div>
                 <div class="irodori_tts_opt">
                     <label for="irodori_tts_profile">

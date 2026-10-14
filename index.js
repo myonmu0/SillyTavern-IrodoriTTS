@@ -4,8 +4,14 @@
 // 動作:
 //  - 参照音声リスト: クリックで追加、❌で削除(セッション中のみ保持)
 //  - コマンド: ["TTS:<音声名>", "<セリフ>"] を解釈 → 参照音声リストと照合 → TTS → 再生
-//  - 送信ボタン横のアイコンボタン: 上記コマンドを実行(停止中のみクリック可)
+//  - 送信ボタン横のアイコンボタン: 上記コマンドを実行
+//     - 停止中: fa-comment クリックで TTS 実行
+//     - AI応答待ち中: fa-circle-stop クリックでポップアップなし即キャンセル
+//     - 再生中: fa-comment-dots クリックでキャンセル確認ポップアップ
 //  - 音声テスト: 旧実装(参照音声/セリフ/送信して再生)をそのまま残す
+//
+// AIリクエストは ConnectionManagerRequestService.sendRequest で指定プロファイルへ
+// 直接送信する(グローバルの接続切替は発生しない)。
 //
 // フロー: ST(ブラウザ) --fetch--> Irodori-TTS コンテナ
 
@@ -13,10 +19,6 @@
 import { extension_settings, loadExtensionSettings, getContext } from '../../../extensions.js';
 import {
     saveSettingsDebounced,
-    generateQuietPrompt,
-    setExtensionPrompt,
-    extension_prompt_types,
-    extension_prompt_roles,
     eventSource,
     event_types,
 } from '../../../../script.js';
@@ -30,7 +32,16 @@ let currentAudio = null;
 
 // 送信ボタン横の TTS アイコンボタン
 const SPEAK_BTN_ID = 'irodori_tts_speak_btn';
-let isSpeaking = false; // TTS 実行中か(アイコン状態切替用)
+let isSpeaking = false;   // TTS 実行中か(全体。AI生成〜再生完了まで)
+let isWaitingAi = false;  // AI 応答待ち中か(この間は circle-stop アイコンで即キャンセル可)
+let isPaused = false;     // 再生一時停止中か(この間は circle-play アイコン)
+
+// 再生中クリックのダブルクリック判定窓 (ms): この間隔内の連続クリックでキャンセル確認
+const SPEAK_DBLCLICK_MS = 400;
+let lastSpeakClickAt = 0; // 前回クリック時刻 (ダブルクリック判定用)
+
+// 実行中 TTS の AI リクエスト中断用 AbortController
+let currentAbortController = null;
 
 // 参照音声リスト: name -> { type: 'file'|'folder', files: File[] }
 // 単ファイル: { type:'file', files:[File] }
@@ -46,6 +57,7 @@ const DEFAULTS = Object.freeze({
     endpoint: 'http://localhost:9040',
     text: 'こんにちは、はじめまして！',
     role: 'user',
+    history: 10,  // 送信するチャット履歴件数 (0 = 全件)
     profile: '', // '' = 現在のプロファイルをそのまま使用
     prompts: null, // [{name, text}, ...]  後方互換: null なら下の sysprompt から初期1件生成
     selectedPrompt: 0, // 現在選択中のインデックス
@@ -55,14 +67,16 @@ Output format (one or more commands):
 ["TTS", "voice_name", "dialogue text"]
 
 Examples:
-["TTS", "voice_happy.wav", "Hello, this is a test."], ["TTS", "voice_normal.wav", "Here is the next line."]
+["TTS", "Alice.wav", "Hello!"],
+["TTS", "Bob_happy.wav", "How are you?"],
+["TTS", "Charlie", "I'm fine, thank you."]
 
 Rules:
 - Extract ALL dialogue lines, from the first to the last, without skipping any.
 - Output the commands in the same order as the dialogue appears.
 - Do not include narration, thoughts, or any text outside the commands.
 - Keep each line of dialogue exactly as written; do not translate or paraphrase.
-- Choose the most appropriate voice name from the available voices listed below.`,
+- Use ONLY the voice names listed under "Available voices". Never create, guess, or imagine a voice name.`,
 });
 
 function settings() {
@@ -93,6 +107,7 @@ export async function loadSettings() {
     $('#irodori_tts_endpoint').val(s.endpoint);
     $('#irodori_tts_text').val(s.text);
     $('#irodori_tts_role').val(s.role || 'user');
+    $('#irodori_tts_history').val(historyFromSettings());
     refreshProfileSelect(s.profile || '');
 
     // Enable チェックボックス + 送信ボタン横アイコンの表示制御
@@ -116,6 +131,7 @@ function persist() {
     const cur = getCurrentPrompt();
     if (cur) cur.text = $('#irodori_tts_sysprompt').val() || '';
     s.role = $('#irodori_tts_role').val() || 'user';
+    s.history = getHistoryLimit();
     s.profile = $('#irodori_tts_profile').val() || '';
     s.enabled = $('#irodori_tts_enable').is(':checked');
     // volume は有効な値のときだけ保存(DOM 未構築/空のときに 0 で上書きしないため)
@@ -136,30 +152,105 @@ function persist() {
 
 // ── 送信ボタン横の TTS アイコンボタン ───────────────────────────────
 // #send_but のすぐ左に挿入。Enable 時のみ表示。
-// 停止中: fa-comment / 喋り中: fa-comment-dots + 点滅アニメ
-function buildSpeakButton() {
-    // 既存があれば削除
-    $(`#${SPEAK_BTN_ID}`).remove();
-    const cls = isSpeaking ? 'fa-solid fa-comment-dots' : 'fa-solid fa-comment';
-    const title = isSpeaking ? 'Speaking…' : 'Run TTS';
-    const $btn = $(`<div id="${SPEAK_BTN_ID}" class="${cls} interactable" title="${title}" tabindex="0"></div>`);
-    $btn.on('click', () => {
-        if (!isSpeaking) {
-            // 停止中: TTS 実行
-            void ttsLastMessage();
-            return;
-        }
-        // 喋り中: キャンセル確認ポップアップ
+// 停止中: fa-comment / AI応答待ち: fa-circle-stop / 再生中: fa-comment-dots
+// 一時停止中: fa-circle-play
+function speakBtnIcon() {
+    if (isWaitingAi) return { cls: 'fa-solid fa-circle-stop', title: 'Cancel TTS' };
+    if (isPaused) return { cls: 'fa-solid fa-circle-play', title: 'Resume' };
+    if (isSpeaking) return { cls: 'fa-solid fa-comment-dots', title: 'Speaking…' };
+    return { cls: 'fa-solid fa-comment', title: 'Run TTS' };
+}
+
+// 再生を一時停止 / 再開する。再生中のクリック 1回で呼ばれる。
+function togglePausePlayback() {
+    const a = currentAudio;
+    if (!a) {
+        // セリフの合間(間隔待機/生成待ち)では対象オーディオが無い。
+        // フラグのみ切替えて、再生側ループのゲートで「次のセリフの開始」を止める。
+        // (生成側には影響しない: 停止中も音声化は続き、キューへ蓄積される)
+        isPaused = !isPaused;
+        refreshSpeakButton();
+        return;
+    }
+    if (a.paused) {
+        // 再開
+        isPaused = false;
+        refreshSpeakButton();
+        a.play().catch((e) => {
+            // 再開失敗(稀)は止めておく
+            console.warn(`[${EXT}] Resume failed:`, e);
+            isPaused = false;
+            refreshSpeakButton();
+        });
+    } else {
+        // 一時停止
+        a.pause();
+        isPaused = true;
+        refreshSpeakButton();
+    }
+}
+
+// 一時停止フラグを解除 + アイコンを更新
+function resetPauseState() {
+    if (!isPaused) return;
+    isPaused = false;
+    refreshSpeakButton();
+}
+
+// 再生中クリック:
+// - 再生中 (isPaused=false): 1回目は即一時停止、400ms以内の2回目でキャンセル確認
+// - 一時停止中 (isPaused=true): 1回目は即再開、400ms以内の2回目でキャンセル確認
+let speakClickTimer = null;
+function onSpeakingClick() {
+    const now = Date.now();
+    const isDouble = (now - lastSpeakClickAt) <= SPEAK_DBLCLICK_MS;
+    lastSpeakClickAt = now;
+
+    if (isDouble) {
+        // 2回目(速いクリック): 保留中のタイマーをクリアしてキャンセル確認
+        if (speakClickTimer) { clearTimeout(speakClickTimer); speakClickTimer = null; }
+        lastSpeakClickAt = 0;
         void (async () => {
             const ok = await Popup.show.confirm(
                 'Cancel TTS?',
-                'Cancel?',
+                '',
                 { okButton: 'YES', cancelButton: 'NO' },
             );
             if (ok === POPUP_RESULT.AFFIRMATIVE) {
                 cancelCurrentTts();
             }
         })();
+        return;
+    }
+
+    // 1回目: 即トグル。タイマーはダブルクリック判定のためだけに仕掛ける
+    togglePausePlayback();
+    if (speakClickTimer) clearTimeout(speakClickTimer);
+    speakClickTimer = setTimeout(() => {
+        speakClickTimer = null;
+        lastSpeakClickAt = 0;
+        // 既にトグル済みなので何もしない
+    }, SPEAK_DBLCLICK_MS);
+}
+
+function buildSpeakButton() {
+    // 既存があれば削除
+    $(`#${SPEAK_BTN_ID}`).remove();
+    const { cls, title } = speakBtnIcon();
+    const $btn = $(`<div id="${SPEAK_BTN_ID}" class="${cls} interactable" title="${title}" tabindex="0"></div>`);
+    $btn.on('click', () => {
+        // AI応答待ち中: ポップアップなしで即キャンセル
+        if (isWaitingAi) {
+            cancelCurrentTts();
+            return;
+        }
+        if (!isSpeaking) {
+            // 停止中: TTS 実行
+            void ttsLastMessage();
+            return;
+        }
+        // 再生中(一時停止中含む): 単発=一時停止/再開、速い2回押し=キャンセル確認
+        onSpeakingClick();
     });
     return $btn;
 }
@@ -180,15 +271,25 @@ function refreshSpeakButton() {
         $newBtn.insertBefore($send);
     } else {
         // 既存ボタンの状態を更新(アイコン・タイトル・クラス)
-        const cls = isSpeaking ? 'fa-solid fa-comment-dots' : 'fa-solid fa-comment';
-        const title = isSpeaking ? 'Speaking…' : 'Run TTS';
+        const { cls, title } = speakBtnIcon();
         $btn.attr('class', `${cls} interactable`).attr('title', title);
     }
 }
 
-// 喋り中フラグをセット + アイコン状態を更新
+// 実行状態フラグをセット + アイコン状態を更新
 function setSpeaking(v) {
     isSpeaking = !!v;
+    if (!v) {
+        isWaitingAi = false;
+        resetPauseState();
+    }
+    if (settings().enabled) refreshSpeakButton();
+}
+
+// AI 応答待ち状態をセット + アイコン状態を更新
+function setWaitingAi(v) {
+    isWaitingAi = !!v;
+    if (v) isSpeaking = true;
     if (settings().enabled) refreshSpeakButton();
 }
 
@@ -200,6 +301,23 @@ function getVolume() {
     if (!Number.isFinite(v)) v = DEFAULTS.volume;
     v = Math.min(100, Math.max(0, v));
     return v;
+}
+
+// 保存値から履歴件数を得る (0 = 全件)。未設定/不正値はデフォルト (0) を返す
+function historyFromSettings() {
+    const raw = settings().history;
+    const v = (raw == null) ? NaN : Number(raw);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULTS.history;
+}
+
+// 送信するチャット履歴件数を返す (0 = 全件)。DOM の入力値を優先し、未構築/不正なら保存値
+function getHistoryLimit() {
+    const $h = $('#irodori_tts_history');
+    if ($h.length > 0) {
+        const v = Number($h.val());
+        if (Number.isFinite(v) && v >= 0) return Math.floor(v);
+    }
+    return historyFromSettings();
 }
 
 // 再生間隔 (秒) → 0〜10 にクランプして返す。未設定/不正値ならデフォルト (2) を返す
@@ -347,15 +465,21 @@ function getConnectionProfiles() {
     } catch { return []; }
 }
 
-function getCurrentProfileName() {
+function getCurrentProfileId() {
     try {
         const st = getContext();
-        const cm = st?.extensionSettings?.connectionManager;
-        if (!cm) return '';
-        const sel = cm.selectedProfile;
-        const p = (cm.profiles || []).find(x => x.id === sel);
-        return p?.name || '';
+        return st?.extensionSettings?.connectionManager?.selectedProfile || '';
     } catch { return ''; }
+}
+
+// Connection Manager が有効か(無効なら sendRequest 不可)
+function isConnectionManagerActive() {
+    try {
+        const st = getContext();
+        return !!st?.ConnectionManagerRequestService?.sendRequest
+            && !st?.extensionSettings?.disabledExtensions?.includes('connection-manager')
+            && !!st?.extensionSettings?.connectionManager;
+    } catch { return false; }
 }
 
 function refreshProfileSelect(selected) {
@@ -374,35 +498,36 @@ function refreshProfileSelect(selected) {
     }
 }
 
-// 指定 Connection Profile に切替(空文字なら何もしない)。fn 実行後、元のプロファイルに戻す。
-// 切替は公式スラッシュコマンド /profile <名前> await=true を経由(接続確立まで待つ)。
-async function withProfile(profileName, fn) {
-    if (!profileName) return await fn();
-
-    const exists = getConnectionProfiles().some(p => p.name === profileName);
-    if (!exists) {
-        toastr.warning(`Connection Profile "${profileName}" not found. Continuing with the current profile.`, EXT);
-        return await fn();
+// 設定のプロファイル名 → プロファイルID を解決。
+// '' (未選択) なら Connection Manager の現在選択プロファイルIDを返す。
+// 見つからなければ null を返す。
+function resolveProfileId(profileName) {
+    const profiles = getConnectionProfiles();
+    if (profileName) {
+        const p = profiles.find(x => x.name === profileName);
+        return p ? p.id : null;
     }
+    return getCurrentProfileId() || null;
+}
 
-    const prevName = getCurrentProfileName();
+// ConnectionManagerRequestService.sendRequest で指定プロファイルへ直接リクエストする。
+// (グローバルの接続切替は発生しない)
+// messages: [{role, content}, ...] / signal: AbortSignal
+// 戻り値: 応答テキスト (エラー時は throw)
+async function generateViaProfile(profileId, messages, signal) {
     const st = getContext();
-    try {
-        // /profile <名前> await=true timeout=5000 で切替(接続確立待ち)
-        const switched = await st.executeSlashCommands(`/profile "${profileName.replace(/"/g, '\\"')}" await=true timeout=5000`);
-        console.log(`[${EXT}] Connection Profile 切替: ${prevName || '(none)'} → ${switched}`);
-        return await fn();
-    } finally {
-        // 元に戻す(元が無名なら <None>)
-        if (prevName) {
-            try {
-                const back = await st.executeSlashCommands(`/profile "${prevName.replace(/"/g, '\\"')}" await=true timeout=5000`);
-                console.log(`[${EXT}] Connection Profile 復元: → ${back}`);
-            } catch (e) {
-                console.warn(`[${EXT}] プロファイル復元失敗:`, e);
-            }
-        }
+    const svc = st?.ConnectionManagerRequestService;
+    if (!svc?.sendRequest) {
+        throw new Error('ConnectionManagerRequestService is unavailable');
     }
+    const result = await svc.sendRequest(
+        profileId,
+        messages,
+        undefined, // maxTokens: プリセット既定値を使用
+        { stream: false, extractData: true, includePreset: true, signal },
+    );
+    // 非ストリーム + extractData:true なら ExtractedData { content, reasoning } が返る
+    return result?.content || '';
 }
 
 function stopCurrentAudio() {
@@ -432,24 +557,19 @@ let queueProducerDone = false; // 生成側が全コマンドを処理済み
 let queueWakeup = null;        // 再生側を起こす resolver
 
 // TTS 中断要求: 再生中の音声を即座に停止し、次以降をスキップ、アイコンを停止中に戻す。
+// AI リクエスト待ち中なら HTTP リクエスト自体も中断する。
 function cancelCurrentTts() {
     ttsAbort.aborted = true;
+    resetPauseState();
+    if (currentAbortController) {
+        try { currentAbortController.abort(); } catch (_) { /* noop */ }
+        currentAbortController = null;
+    }
     stopCurrentAudio();
     setSpeaking(false);
 }
 
-function setButtonBusy(selector, iconClass, busy) {
-    const $btn = $(selector);
-    if (busy) {
-        $btn.addClass('disabled');
-        $btn.find('i').removeClass(iconClass).addClass('fa-spinner fa-spin');
-    } else {
-        $btn.removeClass('disabled');
-        $btn.find('i').removeClass('fa-spinner fa-spin').addClass(iconClass);
-    }
-}
-
-// ── 参照音声リストUI ────────────────────────────────────────────────────────
+// ── 参照音声リストUI ─────────────────────────────────────────────────────────────
 function escapeAttr(s) {
     return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -601,14 +721,22 @@ function parseOneBlock(chunk) {
         return null; // 破損ブロックはスキップ
     }
     if (!Array.isArray(parsed) || parsed.length < 2) return null;
-    const head = String(parsed[0] ?? '');
-    if (head.toUpperCase() !== 'TTS') return null;
-    if (parsed.length < 3) return null; // ["TTS", voice, text] の 3 要素必須
-    const voice = String(parsed[1] ?? '').trim();
-    const text = String(parsed[2] ?? '').trim();
-    if (!text) return null;
-    const caption = (parsed.length >= 4 && parsed[3] != null) ? String(parsed[3]).trim() : '';
-    return { voice, text, caption };
+
+    // 配列の配列 (例: [["TTS", "v.wav", "text"], ...]) → 内側の各要素を処理
+    const items = Array.isArray(parsed[0]) ? parsed : [parsed];
+    const results = [];
+    for (const item of items) {
+        if (!Array.isArray(item) || item.length < 2) continue;
+        const head = String(item[0] ?? '');
+        if (head.toUpperCase() !== 'TTS') continue;
+        if (item.length < 3) continue;
+        const voice = String(item[1] ?? '').trim();
+        const text = String(item[2] ?? '').trim();
+        if (!text) continue;
+        const caption = (item.length >= 4 && item[3] != null) ? String(item[3]).trim() : '';
+        results.push({ voice, text, caption });
+    }
+    return results.length > 0 ? results : null;
 }
 
 function parseCommands(raw) {
@@ -619,7 +747,7 @@ function parseCommands(raw) {
     const cmds = [];
     for (const b of blocks) {
         const c = parseOneBlock(b);
-        if (c) cmds.push(c);
+        if (Array.isArray(c)) cmds.push(...c);
     }
     if (cmds.length === 0) throw new Error('No valid ["TTS", voice, text] blocks');
     return cmds;
@@ -690,16 +818,20 @@ async function playBlob(blob) {
     const finished = new Promise((resolve) => {
         audio.onended = () => {
             if (audio !== currentAudio) { resolve(false); return; } // 別音声に切替
+            resetPauseState();
             stopCurrentAudio();
             resolve(true);
         };
         audio.onerror = () => {
             if (audio !== currentAudio) { resolve(false); return; }
+            resetPauseState();
             stopCurrentAudio();
             resolve(false);
         };
         // 外部停止(切替)時: stopCurrentAudio は onended/onerror を null にするため、
-        // この onpause 経由で Promise を解決しないと待ちが永久に続く
+        // この onpause 経由で Promise を解決しないと待ちが永久に続く。
+        // 一時停止(ユーザー操作)の場合は現行実行のまま待ち続けたいので、
+        // currentAudio が同一のまま停まっているときは解決しない。
         audio.onpause = () => {
             if (audio !== currentAudio) resolve(false);
         };
@@ -756,6 +888,16 @@ async function checkHealth() {
 
 // ── 音声テスト: 送信して再生 ───────────────────────────────────────────
 async function sendAndPlay() {
+    // 中断状態をリセットする。
+    // キャンセル後に ttsAbort.aborted が true のまま残っていると、以後の音声テストが
+    // ttsSynthesize() の中断チェックで黙って失敗し、テストボイスが一切再生されなくなる。
+    // runId を進めて新しい中断世代を作ることで、残留した旧 TTS パイプライン
+    // (生成/再生ループ)も runId 不一致で確実に停止させる。
+    // 実行中の TTS があった場合は currentAudio の停止とアイコン復元もここで行う。
+    ttsAbort = { aborted: false, runId: ++ttsRunId };
+    stopCurrentAudio();
+    setSpeaking(false);
+
     persist();
     const s = settings();
     const text = (s.text || '').trim();
@@ -773,10 +915,7 @@ async function sendAndPlay() {
 function resolveRefFiles(voiceName) {
     if (!voiceName) return null;
     const entry = refAudioMap.get(voiceName);
-    if (!entry) {
-        toastr.warning(`Reference "${voiceName}" not in list. Continuing without reference.`, EXT, { timeOut: 4000 });
-        return null;
-    }
+    if (!entry) return null;
     // フォルダの場合は既にソート済みで保持しているのでそのまま返す
     return entry.files;
 }
@@ -800,6 +939,11 @@ async function playCommandsSequentially(cmds, runId) {
             for (let idx = 0; idx < cmds.length; idx++) {
                 if (ttsAbort.aborted || ttsAbort.runId !== runId || stopGen.stop) return;
                 const c = cmds[idx];
+                // 参照音声が指定されているがリストに無い → このセリフはスキップ
+                if (c.voice && !refAudioMap.has(c.voice)) {
+                    toastr.warning(`Reference audio "${c.voice}" not found.`, EXT, { timeOut: 5000 });
+                    continue;
+                }
                 const refFiles = resolveRefFiles(c.voice) || [];
                 const blob = await ttsSynthesize(c.text, c.caption, refFiles);
                 // 取得中に中断/新実行/打ち切りが来たら破棄して生成を止める
@@ -819,6 +963,11 @@ async function playCommandsSequentially(cmds, runId) {
     let waitProducer = true;
     let playedCount = 0; // 再生間隔は「最初の音声の前」には適用しないためのカウンタ
     while (true) {
+        // 一時停止ゲート: 一時停止中は次のセリフを開始させない。
+        // (生成側は止めないため、停止中も音声化は続きキューへ蓄積される)
+        while (isPaused && !ttsAbort.aborted && ttsAbort.runId === runId) {
+            await new Promise((r) => setTimeout(r, 100));
+        }
         if (ttsAbort.aborted || ttsAbort.runId !== runId) {
             // 中断: 以降の生成は producer が自律的に破棄する
             stopGen.stop = true;
@@ -833,7 +982,8 @@ async function playCommandsSequentially(cmds, runId) {
             if (playedCount > 0 && getInterval() > 0) {
                 const ms = getInterval() * 1000;
                 const until = Date.now() + ms;
-                while (Date.now() < until) {
+                // 一時停止中は残り時間のカウントダウンを凍結する(待ちが停止時間分延びないように)
+                while (Date.now() < until || isPaused) {
                     // 待っている間に中断/新実行が来たら待ちを打ち切り
                     if (ttsAbort.aborted || ttsAbort.runId !== runId) break;
                     await new Promise((r) => setTimeout(r, Math.min(100, until - Date.now())));
@@ -887,7 +1037,6 @@ function wakePlayConsumer() {
 }
 
 // ── TTS実行 (AI生成 → 順次再生) ──────────────────────────────────────
-const INJECT_KEY = 'irodori_tts_sysprompt';
 
 async function ttsLastMessage() {
     persist();
@@ -906,39 +1055,95 @@ async function ttsLastMessage() {
         return;
     }
 
-    // Role 選択 → extension_prompt_roles へ
-    const roleKey = (s.role || 'user').toLowerCase();
-    const roleEnum = roleKey === 'user' ? extension_prompt_roles.USER : extension_prompt_roles.SYSTEM;
+    // プロファイル解決(未選択なら現在のプロファイル)。
+    // 指定名が見つからない場合も現在のプロファイルで続行(旧実装と同じ挙動)。
+    if (!isConnectionManagerActive()) {
+        toastr.warning('Connection Manager is unavailable. TTS generation requires it.', EXT, { timeOut: 6000 });
+        return;
+    }
+    const profileId = resolveProfileId(s.profile || '');
+    if (s.profile && profileId === null) {
+        toastr.warning(`Connection Profile "${s.profile}" not found. Continuing with the current profile.`, EXT);
+    }
+    const effectiveProfileId = profileId || getCurrentProfileId();
+    if (!effectiveProfileId) {
+        toastr.error('No connection profile selected. Select one in Connection Manager.', EXT);
+        return;
+    }
+
+    // ── AIへ送るメッセージを構築: キャラカード → チャット履歴 → TTS指示 ──
+    const st = getContext();
+
+    // (1) キャラカード (description のみ。空ならセクション自体を省略)
+    const ctxMessages = [];
+    const char = st?.characters?.[st?.characterId];
+    const description = (char?.description || '').trim();
+    if (description) {
+        ctxMessages.push({ role: 'system', content: `<characters>\n<description>${description}</description>\n</characters>` });
+    }
+
+    // (2) チャット履歴 (設定件数、0=全件)。role は発言者種別に応じて正規化
+    const chat = st?.chat || [];
+    const limit = getHistoryLimit();
+    const start = limit > 0 ? Math.max(0, chat.length - limit) : 0;
+    let historyCount = 0;
+    for (let i = start; i < chat.length; i++) {
+        const m = chat[i];
+        const content = (m?.mes || '').trim();
+        if (!content) continue;
+        const isUser = m?.is_user === true || m?.is_user === 'true';
+        const isSystem = m?.is_system === true || m?.is_system === 'true';
+        ctxMessages.push({
+            role: isUser ? 'user' : isSystem ? 'system' : 'assistant',
+            content,
+        });
+        historyCount++;
+    }
+    if (historyCount === 0) {
+        toastr.warning('No chat message to speak.', EXT);
+        return;
+    }
 
     // 末尾に利用可能音声一覧を付与 (カンマ区切り)
     const voiceListStr = voiceNames.join(', ');
     const fullSysPrompt = `${sysPromptBase}\n\nAvailable voices (you must choose ONLY from these): ${voiceListStr}`;
 
-    // AI に送るメッセージ全文をブラウザコンソールに出力
-    console.log(`[${EXT}] ===== AI へ送信するシステムプロンプト (chat depth 0) =====`);
+    // AI に送るメッセージ構成をブラウザコンソールに出力
+    console.log(`[${EXT}] ===== AI へ送信するリクエスト (カード: ${ctxMessages[0]?.role === 'system' ? '有' : '無'} / 履歴: ${historyCount}件${limit > 0 ? '' : ' (全件)'} / Role: ${s.role || 'user'}) =====`);
     console.log(fullSysPrompt);
+    console.log(ctxMessages);
     console.log(`[${EXT}] ============================================================`);
 
     // ここからが「喋り中」: AI生成〜再生まで。finally で必ず停止中に戻す。
     const runId = ++ttsRunId;
     ttsAbort = { aborted: false, runId };
     setSpeaking(true);
+    setWaitingAi(true);
+    currentAbortController = new AbortController();
+    const signal = currentAbortController.signal;
     try {
-        // chat depth 0 のシステムプロンプトとして注入
-        setExtensionPrompt(
-            INJECT_KEY,
-            fullSysPrompt,
-            extension_prompt_types.IN_CHAT,
-            0, // depth 0 = 最後のメッセージの直後(末尾)
-            false,
-            roleEnum,
-        );
-
-        // 選択プロファイルで生成(未選択なら現在のまま)。終わったら元のプロファイルに戻す。
-        const response = await withProfile(s.profile, () => generateQuietPrompt({ quietPrompt: '' }));
+        // 指定プロファイルへ直接リクエスト(接続切替なし)。
+        // メッセージは自前構築: キャラカード → チャット履歴 → TTS指示(末尾)
+        // (TTS指示の role には Role設定の system/user を適用)
+        const roleKey = (s.role || 'user').toLowerCase() === 'system' ? 'system' : 'user';
+        let response;
+        try {
+            response = await generateViaProfile(effectiveProfileId, [
+                ...ctxMessages,
+                { role: roleKey, content: fullSysPrompt },
+            ], signal);
+        } catch (e) {
+            // キャンセルによる中断ならトーストを出さずに静かに終わる
+            if (signal.aborted || ttsAbort.aborted || ttsAbort.runId !== runId) return;
+            toastr.error(`AI request failed: ${e?.message || e}`, EXT, { timeOut: 8000 });
+            return;
+        }
 
         // ユーザーが生成中にキャンセルした場合 / 新実行が始まった場合
         if (ttsAbort.aborted || ttsAbort.runId !== runId) return;
+
+        // AI 応答待ち終了: 以後は再生フェーズ(circle-stop → comment-dots)
+        setWaitingAi(false);
 
         console.log(`[${EXT}] ===== AI 応答 =====`);
         console.log(response);
@@ -960,8 +1165,7 @@ async function ttsLastMessage() {
 
         await playCommandsSequentially(cmds, runId);
     } finally {
-        // 注入をクリア(以降の通常生成に影響しないように)
-        setExtensionPrompt(INJECT_KEY, '', extension_prompt_types.IN_CHAT, 0, false, roleEnum);
+        currentAbortController = null;
         // この実行が最新のときだけアイコンを戻す(キャンセル済みの旧実行が上書きしない)
         if (ttsAbort.runId === runId) setSpeaking(false);
     }
@@ -974,6 +1178,8 @@ function initListeners() {
     $('#irodori_tts_text').on('input', () => persist());
     $('#irodori_tts_sysprompt').on('input', () => persist());
     $('#irodori_tts_role').on('change', () => persist());
+    $('#irodori_tts_history').on('input change', () => persist());
+    $('#irodori_tts_profile').on('focus', () => refreshProfileSelect());
     $('#irodori_tts_profile').on('change', () => persist());
     $('#irodori_tts_enable').on('change', () => persist());
 

@@ -12,19 +12,19 @@ AI powered Multi-voice TTS which use [Irodori-TTS](https://github.com/Aratako/Ir
 - Runs voice cloning while speaking, so you don't have to wait on the interval.
 - You can run the TTS server on vastai/runpod, so you don't need a GPU.
 
-**IrodoriTTS is a Japanese good TTS, not tested in other language.*
+**IrodoriTTS is a Japanese good TTS.*
 
 
 # Install
 **Tested on Linux, if you have any issue try giving this repo to AI and ask.*
 
 **1. Install IrodoriTTS**<br />
-Because of isolation, you may prefer to install in a Docker/Podman container but this is not mandatory.
+If you prefer to install in a Docker/Podman container:
 ```
-# Create a container
+# Create a container, this are podman example
 podman run -d --device nvidia.com/gpu=all --name irodori-tts --network=host ubuntu:24.04 sleep infinity
 
-# Make sure the GPU are working
+# Check GPU
 nvidia-smi
 
 # Upgrade the system, install what you need, create a user account to install/run the server.
@@ -45,8 +45,9 @@ cd /path/to/your/Irodori-TTS
 cd /path/to/your/st-irodori-bridge
 python3 ./st-irodori-bridge.py -v --irodori-dir /path/to/your/Irodori-TTS --host 127.0.0.1 --port 9040
 ```
-
-Note: This bridge are intend to be only accessed by local user(set 127.0.0.1 or make sure only you can access) If you will run on Vastai/Runpod, don't open a port, instead use SSH Tunnel so only you can access. 
+**Change the /path/to/your*<br />
+**To lower VRAM add --bf16, --quant int8 or --quant int4*<br />
+**This bridge are intend to be only accessed by local user(set 127.0.0.1 or make sure only you can access) If you will run on Vastai/Runpod, don't open a port, instead use SSH Tunnel so only you can access.*
 
 **3. Install SillyTavern-IrodoriTTS**<br />
 SillyTavern > Extensions > Install extension > copy&paste this github url and install.
@@ -58,7 +59,7 @@ SillyTavern > Extensions > Install extension > copy&paste this github url and in
 **1. Make your reference voice**<br />
 First you will need a reference audio, an clear voice of the character without BGM, about 10 second audio works fine.
 
-Here are some usefull tools for this: 
+Usefull tools: 
 
 - https://github.com/tsurumeso/vocal-remover
 
@@ -72,21 +73,37 @@ Rename the reference file like the follow: Alice_normal.wav, Bob_normal.wav, Bob
 ![demo2](assets/demo_2_en.png)
 
 **Note:**
+- Chat history means how many latest messages will be sent for TTS. lower are faster but may impact accuracy, set 0 to send all.
 - Don't forget to run the bridge.
 - Uploaded reference audio will clear after reloading the browser.
 - Only Chat Completion are supported. 
 
 
 **3. Run TTS**<br />
-Load a chat, press the "Run TTS" button and wait. 
+Is better creating a connection profile for TTS.
+1. SillyTavern > API Connection(🔌）
+2. Select a model strong in logic(ex: GLM, DeepSeek new one), make thinking ON, increase "Max Response Length (tokens)" to something like 20000.
+3. Press "Create new connection profile"
+4. Select that profile on Irodori TTS Connection.
 
-Common issue:
-- Connection error: Make sure the TTS server and the bridge are working.
-- AI Fail to create the TTS: Make sure "Max Response Length (tokens)" is high enough, try using a stronger model(GLM or DeepSeek new one are cheap and good), try Thinking mode, try different model, change Role to User/System. You can see in the terminal running SillyTavern the TTS Prompt sent and the answer of the AI.
-- It play, but voice don't match: Rename the reference audio to match the character name of the story, or edit the TTS Prompt to do what you want.
-- Bad voice: Reference audio may be bad, if you press F12 and open DevTools you can see the reference audio used, you can go to "Voice Test" field and test, if not good make a new one.
+Done, now load a chat and press TTS button and wait.<br />
+1 click to pause while speaking, double click to cancel TTS.
 
+### Common issue
+#### Connection error
+Make sure the TTS server and the bridge are working.
+
+#### AI Fail to create the TTS
+- You can see in the terminal running SillyTavern the TTS Prompt sent and the answer of the AI, this whill help the process.
+- Change Role to User/System
+- Rename the reference audio to match the character name of the story
+- Edit the TTS Prompt to do what you want.
+- Increase Chat History
+
+#### Bad voice
+Test your voice on "Voice Test" field.
 
 Enjoy ;)
+
 
 
